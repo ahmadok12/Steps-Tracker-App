@@ -5,12 +5,8 @@ import android.content.res.ColorStateList
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
-import android.text.InputType
 import android.view.LayoutInflater
 import android.view.View
-import android.widget.EditText
-import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -18,11 +14,8 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.button.MaterialButton
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.truesteps.app.ui.StepRingView
 import com.truesteps.app.ui.WeekChartView
 import java.text.SimpleDateFormat
@@ -73,19 +66,9 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = false
         setContentView(R.layout.activity_main)
         db = StepDatabase.get(this)
-
-        // Keep content clear of the status bar / gesture bar (edge-to-edge on Android 15).
-        val content = findViewById<View>(R.id.content)
-        val basePadTop = content.paddingTop
-        val basePadBottom = content.paddingBottom
-        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.root)) { _, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            content.setPadding(content.paddingLeft, basePadTop + bars.top, content.paddingRight, basePadBottom + bars.bottom)
-            insets
-        }
+        applyInsets(this, findViewById(R.id.root), findViewById(R.id.content))
 
         dateText = findViewById(R.id.dateText)
         statusDot = findViewById(R.id.statusDot)
@@ -114,16 +97,12 @@ class MainActivity : AppCompatActivity() {
             handler.postDelayed({ refresh() }, 300)
         }
 
-        findViewById<View>(R.id.batteryButton).setOnClickListener {
-            try {
-                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-            } catch (e: Exception) {
-                startActivity(Intent(Settings.ACTION_SETTINGS))
-            }
-            toast("Find TrueSteps and set it to \"Don't optimize\" / \"Unrestricted\"")
+        findViewById<View>(R.id.batteryButton).setOnClickListener { openBatterySettings(this) }
+        findViewById<View>(R.id.settingsButton).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
         }
 
-        goalText.setOnClickListener { showGoalDialog() }
+        goalText.setOnClickListener { showGoalDialog(this) { refresh() } }
 
         // Resume automatically if tracking was on (e.g. after the app was swiped away).
         if (Prefs.isTrackingEnabled(this) && !LiveState.serviceRunning && Permissions.hasActivityRecognition(this)) {
@@ -146,33 +125,6 @@ class MainActivity : AppCompatActivity() {
         Prefs.setTrackingEnabled(this, true)
         StepTrackingService.start(this)
         handler.postDelayed({ refresh() }, 500)
-    }
-
-    private fun showGoalDialog() {
-        val input = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText(Prefs.goal(this@MainActivity).toString())
-            setSelection(text.length)
-        }
-        val box = FrameLayout(this).apply {
-            setPadding(dp(24), dp(8), dp(24), 0)
-            addView(input)
-        }
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Daily step goal")
-            .setView(box)
-            .setPositiveButton("Save") { _, _ ->
-                val g = input.text.toString().toIntOrNull()
-                if (g != null && g in 500..100_000) {
-                    Prefs.setGoal(this, g)
-                    StepWidget.updateAll(this)
-                    refresh()
-                } else {
-                    toast("Enter a number between 500 and 100,000")
-                }
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
     }
 
     // ---------------------------------------------------------------- UI
@@ -205,8 +157,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderStatus(now: Long) {
         val running = LiveState.serviceRunning
-        statusPillText.text = if (running) "Tracking" else "Off"
-        statusDot.imageTintList = ColorStateList.valueOf(color(if (running) R.color.lime else R.color.flame))
+        val quietNow = running && LiveState.quietHours
+        statusPillText.text = when {
+            quietNow -> "Quiet hours"
+            running -> "Tracking"
+            else -> "Off"
+        }
+        statusDot.imageTintList = ColorStateList.valueOf(
+            color(if (quietNow) R.color.violet else if (running) R.color.lime else R.color.flame)
+        )
 
         toggleButton.text = if (running) "Stop tracking" else "Start tracking"
         toggleButton.backgroundTintList = ColorStateList.valueOf(color(if (running) R.color.surface_high else R.color.lime))
@@ -216,6 +175,17 @@ class MainActivity : AppCompatActivity() {
             liveActivity.text = "🚶  Not tracking"
             liveGps.text = "📍  GPS off"
             liveExtra.visibility = View.GONE
+            return
+        }
+
+        if (LiveState.quietHours) {
+            liveActivity.setTextColor(color(R.color.text_primary))
+            liveGps.setTextColor(color(R.color.text_primary))
+            liveActivity.text = "🌙  Quiet hours"
+            liveGps.text = "📍  GPS off"
+            liveExtra.visibility = View.VISIBLE
+            liveExtra.text = "Steps are still counted. GPS and activity detection resume at " +
+                QuietHours.format(Prefs.quietEnd(this)) + "."
             return
         }
 
@@ -233,12 +203,14 @@ class MainActivity : AppCompatActivity() {
         liveActivity.setTextColor(color(if (isVehicle) R.color.flame else R.color.text_primary))
 
         val speed = LiveState.lastSpeedKmh
+        val recentSpeed = speed != null && now - LiveState.lastSpeedTimeMs <= 90_000
         liveGps.text = when {
-            !LiveState.gpsActive -> "📍  GPS idle"
-            speed == null || now - LiveState.lastSpeedTimeMs > 30_000 -> "📍  Finding GPS…"
+            !LiveState.gpsActive && recentSpeed -> "📍  %.0f km/h".format(speed)
+            !LiveState.gpsActive -> "📍  GPS standby"
+            speed == null || now - LiveState.lastSpeedTimeMs > 90_000 -> "📍  Finding GPS…"
             else -> "📍  %.0f km/h".format(speed)
         }
-        val fast = speed != null && LiveState.gpsActive && speed >= 15f && now - LiveState.lastSpeedTimeMs <= 30_000
+        val fast = speed != null && speed >= 15f && now - LiveState.lastSpeedTimeMs <= 90_000
         liveGps.setTextColor(color(if (fast) R.color.flame else R.color.text_primary))
 
         val extras = mutableListOf<String>()

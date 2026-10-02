@@ -31,10 +31,11 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 
 /**
- * Always-on foreground service:
- *  - reads the hardware step counter
- *  - receives activity-recognition updates
- *  - switches GPS on only while steps are coming in (saves battery)
+ * Always-on foreground service, tuned for battery:
+ *  - hardware step counter, batched (the phone's processor can sleep ~10 s at a time)
+ *  - Google activity detection: every 30 s while moving, every 3 min while idle
+ *  - GPS only when it's actually needed, as short bursts (a few fixes, then off)
+ *  - quiet hours: only the step counter runs (no GPS, no activity detection)
  *  - every 30 s hands the window to [StepFilter] and saves the result
  */
 class StepTrackingService : Service(), SensorEventListener {
@@ -44,8 +45,22 @@ class StepTrackingService : Service(), SensorEventListener {
         private const val CHANNEL_ID = "tracking"
         private const val NOTIFICATION_ID = 1
         private const val WINDOW_MS = 30_000L
-        private const val GPS_IDLE_OFF_MS = 120_000L
         private const val MAX_GPS_ACCURACY_M = 40f
+
+        // Step sensor batching
+        private const val STEP_BATCH_US = 10_000_000 // 10 s
+
+        // Activity detection
+        private const val ACTIVITY_MOVING_MS = 30_000L
+        private const val ACTIVITY_IDLE_MS = 180_000L
+        private const val IDLE_AFTER_MS = 120_000L
+
+        // GPS bursts
+        private const val GPS_TRIGGER_STEPS = 20          // steps in the last 30 s before GPS is considered
+        private const val GPS_BURST_FIXES = 3             // good fixes per burst
+        private const val GPS_BURST_MAX_MS = 40_000L      // give up a burst after this long
+        private const val GPS_COOLDOWN_MS = 60_000L       // pause between bursts
+        private const val SPEED_MEMORY_MS = 75_000L       // how long a speed reading is used for decisions
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(context, Intent(context, StepTrackingService::class.java))
@@ -53,6 +68,15 @@ class StepTrackingService : Service(), SensorEventListener {
 
         fun stop(context: Context) {
             context.stopService(Intent(context, StepTrackingService::class.java))
+        }
+
+        /** Ask a running service to re-read settings (e.g. quiet hours changed). */
+        fun refreshSettings(context: Context) {
+            if (LiveState.serviceRunning) {
+                context.startService(
+                    Intent(context, StepTrackingService::class.java).setAction("refresh")
+                )
+            }
         }
     }
 
@@ -65,11 +89,18 @@ class StepTrackingService : Service(), SensorEventListener {
     private var pendingSteps = 0
     private var windowStartMs = 0L
     private var lastStepMs = 0L
+    private val recentSteps = ArrayDeque<Pair<Long, Int>>() // (time, steps) for the last 30 s
 
     private val speeds = mutableListOf<Pair<Long, Float>>() // (time, km/h)
     private var prevLocation: Location? = null
     private var gpsOn = false
+    private var gpsBurstStartMs = 0L
+    private var gpsBurstFixes = 0
+    private var gpsCooldownUntil = 0L
+
     private var activityIntent: PendingIntent? = null
+    private var activityIntervalMs = 0L // 0 = not registered
+    private var quiet = false
 
     private val fused by lazy { LocationServices.getFusedLocationProviderClient(this) }
 
@@ -85,6 +116,8 @@ class StepTrackingService : Service(), SensorEventListener {
             handler.postDelayed(this, WINDOW_MS)
         }
     }
+
+    private val burstTimeout = Runnable { endGpsBurst() }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -106,16 +139,24 @@ class StepTrackingService : Service(), SensorEventListener {
         if (counter == null) {
             Log.e(TAG, "No step counter sensor on this phone")
         } else {
-            sensorManager.registerListener(this, counter, SensorManager.SENSOR_DELAY_NORMAL)
+            // Batched delivery: the sensor hub stores steps and wakes us at most every ~10 s.
+            sensorManager.registerListener(this, counter, SensorManager.SENSOR_DELAY_NORMAL, STEP_BATCH_US)
         }
-        startActivityUpdates()
+        applyMode(System.currentTimeMillis())
         handler.postDelayed(tick, WINDOW_MS)
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "refresh" && LiveState.serviceRunning) {
+            applyMode(System.currentTimeMillis())
+            updateNotification()
+        }
+        return START_STICKY
+    }
 
     override fun onDestroy() {
         handler.removeCallbacks(tick)
+        handler.removeCallbacks(burstTimeout)
         if (LiveState.serviceRunning) {
             closeWindow()
             filter.flushAll(System.currentTimeMillis()).forEach { db.insert(it) }
@@ -128,8 +169,29 @@ class StepTrackingService : Service(), SensorEventListener {
         LiveState.serviceRunning = false
         LiveState.pendingSteps = 0
         LiveState.heldSteps = 0
+        LiveState.quietHours = false
         StepWidget.updateAll(this)
         super.onDestroy()
+    }
+
+    // ---------------------------------------------------------------- modes
+
+    /** Quiet hours on/off, and activity-detection rate (moving vs idle). */
+    private fun applyMode(now: Long) {
+        val q = Prefs.isQuietNow(this, now)
+        if (q != quiet) {
+            quiet = q
+            LiveState.quietHours = q
+            Log.i(TAG, "Quiet hours: $q")
+        }
+        if (quiet) {
+            stopGps()
+            stopActivityUpdates()
+            LiveState.motion = null
+            return
+        }
+        val moving = now - lastStepMs < IDLE_AFTER_MS
+        setActivityInterval(if (moving) ACTIVITY_MOVING_MS else ACTIVITY_IDLE_MS)
     }
 
     // ---------------------------------------------------------------- foreground
@@ -171,11 +233,15 @@ class StepTrackingService : Service(), SensorEventListener {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        val text = buildString {
+            append("%,d vehicle steps removed".format(today.vehicleSteps))
+            if (quiet) append(" · Quiet hours")
+        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_steps)
             .setColor(0xFFC6FF3D.toInt())
             .setContentTitle("${"%,d".format(today.walkSteps)} steps today")
-            .setContentText("${"%,d".format(today.vehicleSteps)} vehicle steps removed")
+            .setContentText(text)
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -218,10 +284,20 @@ class StepTrackingService : Service(), SensorEventListener {
 
     private fun addSteps(n: Int) {
         if (n <= 0) return
+        val now = System.currentTimeMillis()
+        val wasIdle = now - lastStepMs >= IDLE_AFTER_MS
         pendingSteps += n
-        lastStepMs = System.currentTimeMillis()
+        lastStepMs = now
+        recentSteps.addLast(now to n)
         LiveState.pendingSteps = pendingSteps
-        if (!gpsOn) startGps()
+
+        if (wasIdle && !quiet) setActivityInterval(ACTIVITY_MOVING_MS)
+        maybeStartGpsBurst(now)
+    }
+
+    private fun stepsLast30s(now: Long): Int {
+        while (recentSteps.isNotEmpty() && now - recentSteps.first().first > WINDOW_MS) recentSteps.removeFirst()
+        return recentSteps.sumOf { it.second }
     }
 
     private fun bootCount(): Int =
@@ -231,49 +307,94 @@ class StepTrackingService : Service(), SensorEventListener {
 
     private fun closeWindow() {
         val now = System.currentTimeMillis()
-        val windowSpeeds = speeds.filter { it.first >= windowStartMs }.map { it.second }
+        // Prefer readings from this window; otherwise fall back to the last ~75 s,
+        // so one GPS burst also covers the window after it.
+        val inWindow = speeds.filter { it.first >= windowStartMs }.map { it.second }
+        val windowSpeeds = inWindow.ifEmpty {
+            speeds.filter { now - it.first <= SPEED_MEMORY_MS }.map { it.second }
+        }
         val input = WindowInput(
             startMs = windowStartMs,
             endMs = now,
             steps = pendingSteps,
             speedsKmh = windowSpeeds,
-            motion = LiveState.motion,
+            motion = if (quiet) null else LiveState.motion,
         )
         val committed = filter.process(input)
         committed.forEach { db.insert(it) }
 
         pendingSteps = 0
         windowStartMs = now
-        speeds.removeAll { now - it.first > WINDOW_MS * 2 }
+        speeds.removeAll { now - it.first > SPEED_MEMORY_MS }
 
         LiveState.pendingSteps = 0
         LiveState.heldSteps = filter.heldSteps
         LiveState.lastVehicleMs = filter.lastVehicleMs
 
-        // Battery: GPS off when no steps for a while and nothing is waiting for a decision.
-        if (gpsOn && now - lastStepMs > GPS_IDLE_OFF_MS && filter.heldSteps == 0) stopGps()
+        applyMode(now)
+        // Undecided steps waiting? Try to settle them with a GPS reading.
+        if (filter.heldSteps > 0) maybeStartGpsBurst(now, force = true)
 
         if (committed.isNotEmpty()) updateNotification()
     }
 
-    // ---------------------------------------------------------------- GPS
+    // ---------------------------------------------------------------- GPS (bursts)
+
+    /**
+     * GPS is the expensive part, so it only runs when:
+     *  - not in quiet hours, and location permission is granted
+     *  - you're clearly moving (20+ steps in 30 s), or steps are waiting for a decision
+     *  - Google's activity detection isn't already sure on its own
+     *  - the previous burst ended at least a minute ago
+     */
+    private fun maybeStartGpsBurst(now: Long, force: Boolean = false) {
+        if (gpsOn || quiet || now < gpsCooldownUntil) return
+        if (!Permissions.hasLocation(this)) return
+        val recent = stepsLast30s(now)
+        if (!force && recent < GPS_TRIGGER_STEPS) return
+        if (activityIsConfident(now, recent)) return
+        startGps(now)
+    }
+
+    /** True when activity detection alone is trustworthy enough to skip GPS. */
+    private fun activityIsConfident(now: Long, stepsLast30s: Int): Boolean {
+        val m = LiveState.motion ?: return false
+        if (now - m.timeMs > 45_000) return false
+        return when (m.motion) {
+            Motion.VEHICLE, Motion.BICYCLE -> m.confidence >= 80
+            // Walking: also require a normal walking rhythm (1.2–2.6 steps/s),
+            // because engine vibration can sometimes look like walking.
+            Motion.ON_FOOT -> m.confidence >= 85 && (stepsLast30s / 30f) in 1.2f..2.6f
+            else -> false
+        }
+    }
 
     @SuppressLint("MissingPermission")
-    private fun startGps() {
-        if (!Permissions.hasLocation(this)) return
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5_000L)
-            .setMinUpdateIntervalMillis(3_000L)
+    private fun startGps(now: Long) {
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 3_000L)
+            .setMinUpdateIntervalMillis(2_000L)
+            .setMaxUpdateAgeMillis(0L)
             .build()
         try {
             fused.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
             gpsOn = true
+            gpsBurstStartMs = now
+            gpsBurstFixes = 0
             LiveState.gpsActive = true
+            handler.postDelayed(burstTimeout, GPS_BURST_MAX_MS)
         } catch (e: SecurityException) {
             Log.w(TAG, "GPS not allowed", e)
         }
     }
 
+    private fun endGpsBurst() {
+        if (!gpsOn) return
+        stopGps()
+        gpsCooldownUntil = System.currentTimeMillis() + GPS_COOLDOWN_MS
+    }
+
     private fun stopGps() {
+        handler.removeCallbacks(burstTimeout)
         if (!gpsOn) return
         fused.removeLocationUpdates(locationCallback)
         gpsOn = false
@@ -296,22 +417,33 @@ class StepTrackingService : Service(), SensorEventListener {
         speeds += now to kmh
         LiveState.lastSpeedKmh = kmh
         LiveState.lastSpeedTimeMs = now
+
+        gpsBurstFixes++
+        if (gpsBurstFixes >= GPS_BURST_FIXES) endGpsBurst()
     }
 
     // ---------------------------------------------------------------- activity recognition
 
-    @SuppressLint("MissingPermission")
-    private fun startActivityUpdates() {
-        if (!Permissions.hasActivityRecognition(this)) return
+    private fun activityPendingIntent(): PendingIntent {
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
         } else {
             PendingIntent.FLAG_UPDATE_CURRENT
         }
-        val pi = PendingIntent.getBroadcast(this, 1, Intent(this, ActivityUpdatesReceiver::class.java), flags)
+        return PendingIntent.getBroadcast(this, 1, Intent(this, ActivityUpdatesReceiver::class.java), flags)
+    }
+
+    /** (Re)registers activity detection at the given rate; no-op if already at that rate. */
+    @SuppressLint("MissingPermission")
+    private fun setActivityInterval(intervalMs: Long) {
+        if (intervalMs == activityIntervalMs) return
+        if (!Permissions.hasActivityRecognition(this)) return
+        val pi = activityIntent ?: activityPendingIntent()
         try {
-            ActivityRecognition.getClient(this).requestActivityUpdates(10_000L, pi)
+            ActivityRecognition.getClient(this).requestActivityUpdates(intervalMs, pi)
             activityIntent = pi
+            activityIntervalMs = intervalMs
+            Log.i(TAG, "Activity detection every ${intervalMs / 1000}s")
         } catch (e: SecurityException) {
             Log.w(TAG, "Activity recognition not allowed", e)
         }
@@ -326,5 +458,6 @@ class StepTrackingService : Service(), SensorEventListener {
             Log.w(TAG, "removeActivityUpdates failed", e)
         }
         activityIntent = null
+        activityIntervalMs = 0L
     }
 }

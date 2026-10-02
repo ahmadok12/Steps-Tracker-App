@@ -102,19 +102,23 @@ class StepFilter(
         }
         // 2. Activity recognition says vehicle / bike.
         if (motion != null && motion.confidence >= minConfidence) {
-            if (motion.motion == Motion.VEHICLE) {
-                return Decision(Verdict.VEHICLE, "Phone detected in vehicle (${motion.confidence}%)", true)
-            }
-            if (motion.motion == Motion.BICYCLE) {
-                return Decision(Verdict.VEHICLE, "Detected on a bike (${motion.confidence}%)", true)
+            if (motion.motion == Motion.VEHICLE || motion.motion == Motion.BICYCLE) {
+                // GPS says walking pace: could be a traffic jam, or you just parked. Hold and decide later.
+                if (speed != null && speed < walkingMaxSpeedKmh) {
+                    return Decision(Verdict.UNSURE, "Slow, but phone still says vehicle", false)
+                }
+                val what = if (motion.motion == Motion.VEHICLE) "Phone detected in vehicle" else "Detected on a bike"
+                return Decision(Verdict.VEHICLE, "$what (${motion.confidence}%)", true)
             }
         }
         // 3. Impossible cadence = vibration.
         if (w.steps >= 20 && cadence > maxCadencePerSec) {
             return Decision(Verdict.VEHICLE, "Impossible step rate (${"%.1f".format(cadence)}/s)", true)
         }
-        // 4. Activity recognition confirms walking.
-        if (motion != null && motion.motion == Motion.ON_FOOT && motion.confidence >= minConfidence) {
+        // 4. Activity recognition confirms walking (and the rhythm looks like real walking;
+        //    a reading from just before a ride can still say "walking" for a few seconds).
+        val walkingRhythm = w.steps < 20 || cadence in 1.2f..3.2f
+        if (motion != null && motion.motion == Motion.ON_FOOT && motion.confidence >= minConfidence && walkingRhythm) {
             return Decision(Verdict.WALK, "Walking detected (${motion.confidence}%)", true)
         }
         // 5. Shortly after a ride, slow movement could still be traffic.

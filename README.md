@@ -13,7 +13,12 @@ Steps are collected in 30-second blocks. Each block is checked against:
 5. **Right after a ride** (3 minutes): slow movement is held until walking is confirmed. This handles traffic jams and signals.
 6. **Not sure yet** (for example, GPS hasn't locked on at the start of a ride): the block is held. The next clear block decides it.
 
-GPS is switched on only while steps are coming in, and it turns off after 2 minutes without steps.
+## Battery
+
+- GPS runs only in short bursts (3 readings, then off for at least a minute). A burst starts only when there are 20+ steps in 30 seconds and Google's activity detection isn't already confident.
+- Activity detection checks every 30 seconds while you're moving, and every 3 minutes while you're idle.
+- Step updates are grouped about every 10 seconds, so the processor can sleep in between.
+- **Quiet hours** (Settings ⚙): only the step counter runs. GPS and activity detection are off.
 
 The "Recent decisions" list in the app shows every block and the reason it was kept or removed.
 

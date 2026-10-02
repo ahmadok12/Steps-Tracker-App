@@ -49,10 +49,14 @@ class StepWidget : AppWidgetProvider() {
                 views.setTextViewText(R.id.widgetRemoved, "%,d".format(today.vehicleSteps))
                 views.setTextViewText(R.id.widgetDistance, "%.1f km".format(today.walkSteps * 0.76f / 1000f))
                 val running = LiveState.serviceRunning || Prefs.isTrackingEnabled(context)
-                views.setTextViewText(R.id.widgetStatus, if (running) "● Tracking" else "○ Paused")
+                val quiet = running && Prefs.isQuietNow(context)
+                views.setTextViewText(
+                    R.id.widgetStatus,
+                    when { quiet -> "☾ Quiet hours"; running -> "● Tracking"; else -> "○ Paused" }
+                )
                 views.setTextColor(
                     R.id.widgetStatus,
-                    Color.parseColor(if (running) "#C6FF3D" else "#FF5A36")
+                    Color.parseColor(if (quiet) "#8B6CFF" else if (running) "#C6FF3D" else "#FF5A36")
                 )
             }
 

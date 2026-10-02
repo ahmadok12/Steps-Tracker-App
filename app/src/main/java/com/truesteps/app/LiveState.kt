@@ -10,4 +10,5 @@ object LiveState {
     @Volatile var pendingSteps = 0
     @Volatile var heldSteps = 0
     @Volatile var lastVehicleMs = 0L
+    @Volatile var quietHours = false
 }
