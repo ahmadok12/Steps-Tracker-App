@@ -1,6 +1,20 @@
 <resources>
-    <color name="brand">#1B7F5B</color>
-    <color name="brand_dark">#0F5A40</color>
-    <color name="vehicle">#C2541B</color>
-    <color name="icon_bg">#1B7F5B</color>
+    <!-- Bold dark palette -->
+    <color name="bg">#0B0C10</color>
+    <color name="surface">#16181F</color>
+    <color name="surface_high">#20232D</color>
+    <color name="outline">#2A2E3A</color>
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#9AA0B0</color>
+
+    <color name="lime">#C6FF3D</color>      <!-- real steps / primary -->
+    <color name="cyan">#2BE4FF</color>      <!-- ring gradient end -->
+    <color name="flame">#FF5A36</color>     <!-- vehicle / removed -->
+    <color name="violet">#8B6CFF</color>    <!-- secondary accent -->
+    <color name="on_lime">#0B0C10</color>
+
+    <!-- kept for older references -->
+    <color name="brand">#C6FF3D</color>
+    <color name="vehicle">#FF5A36</color>
+    <color name="icon_bg">#0B0C10</color>
 </resources>

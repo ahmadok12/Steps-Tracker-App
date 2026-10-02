@@ -68,6 +68,14 @@ class StepDatabase private constructor(context: Context) :
         return DayTotal(day, walk, vehicle)
     }
 
+    /** Approximate walking time: kept 30-second blocks with real walking in them. */
+    fun walkMinutes(day: String): Int {
+        return readableDatabase.rawQuery(
+            "SELECT COUNT(*) FROM windows WHERE day = ? AND kind = ? AND steps >= 15",
+            arrayOf(day, Kind.WALK.name)
+        ).use { c -> if (c.moveToFirst()) c.getInt(0) / 2 else 0 }
+    }
+
     /** Totals for the last [days] days, newest first (days without data are included as zero). */
     fun recentDays(days: Int, nowMs: Long = System.currentTimeMillis()): List<DayTotal> =
         (0 until days).map { dayTotal(dayKey(nowMs - it * 86_400_000L)) }

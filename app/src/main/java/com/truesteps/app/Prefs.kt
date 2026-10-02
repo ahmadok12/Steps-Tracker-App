@@ -12,6 +12,9 @@ object Prefs {
     fun isTrackingEnabled(c: Context) = prefs(c).getBoolean("tracking", false)
     fun setTrackingEnabled(c: Context, on: Boolean) = prefs(c).edit().putBoolean("tracking", on).apply()
 
+    fun goal(c: Context) = prefs(c).getInt("goal", 10_000)
+    fun setGoal(c: Context, goal: Int) = prefs(c).edit().putInt("goal", goal).apply()
+
     /** Last raw step-counter value + boot it belongs to, so restarts don't lose steps. */
     fun lastCounter(c: Context): Pair<Float, Int> =
         prefs(c).getFloat("counter", -1f) to prefs(c).getInt("boot", -1)

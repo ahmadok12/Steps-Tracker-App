@@ -99,6 +99,7 @@ class StepTrackingService : Service(), SensorEventListener {
             return
         }
         LiveState.serviceRunning = true
+        StepWidget.updateAll(this)
         windowStartMs = System.currentTimeMillis()
 
         val counter = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
@@ -127,6 +128,7 @@ class StepTrackingService : Service(), SensorEventListener {
         LiveState.serviceRunning = false
         LiveState.pendingSteps = 0
         LiveState.heldSteps = 0
+        StepWidget.updateAll(this)
         super.onDestroy()
     }
 
@@ -171,6 +173,7 @@ class StepTrackingService : Service(), SensorEventListener {
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_steps)
+            .setColor(0xFFC6FF3D.toInt())
             .setContentTitle("${"%,d".format(today.walkSteps)} steps today")
             .setContentText("${"%,d".format(today.vehicleSteps)} vehicle steps removed")
             .setContentIntent(open)
@@ -181,6 +184,7 @@ class StepTrackingService : Service(), SensorEventListener {
     }
 
     private fun updateNotification() {
+        StepWidget.updateAll(this)
         if (!Permissions.hasNotifications(this)) return
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification())
     }

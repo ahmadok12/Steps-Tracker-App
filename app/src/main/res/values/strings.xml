@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">TrueSteps</string>
+    <string name="widget_description">Today\'s real steps, with vehicle steps removed</string>
 </resources>

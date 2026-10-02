@@ -1,19 +1,30 @@
 package com.truesteps.app
 
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.view.Gravity
+import android.text.InputType
+import android.view.LayoutInflater
+import android.view.View
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.button.MaterialButton
-import com.google.android.material.progressindicator.LinearProgressIndicator
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.truesteps.app.ui.StepRingView
+import com.truesteps.app.ui.WeekChartView
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -21,12 +32,21 @@ import java.util.Locale
 class MainActivity : AppCompatActivity() {
 
     private lateinit var db: StepDatabase
-    private lateinit var todaySteps: TextView
-    private lateinit var todayRemoved: TextView
+    private lateinit var dateText: TextView
+    private lateinit var statusDot: ImageView
+    private lateinit var statusPillText: TextView
+    private lateinit var ring: StepRingView
+    private lateinit var goalText: TextView
     private lateinit var todayPending: TextView
-    private lateinit var statusText: TextView
+    private lateinit var tileRemoved: TextView
+    private lateinit var tileDistance: TextView
+    private lateinit var tileMinutes: TextView
+    private lateinit var liveActivity: TextView
+    private lateinit var liveGps: TextView
+    private lateinit var liveExtra: TextView
     private lateinit var toggleButton: MaterialButton
-    private lateinit var historyList: LinearLayout
+    private lateinit var weekChart: WeekChartView
+    private lateinit var weekTotal: TextView
     private lateinit var logList: LinearLayout
 
     private val handler = Handler(Looper.getMainLooper())
@@ -36,38 +56,52 @@ class MainActivity : AppCompatActivity() {
             handler.postDelayed(this, 2_000)
         }
     }
+    private var lastLogSignature = ""
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
             if (Permissions.hasActivityRecognition(this)) {
                 if (!Permissions.hasLocation(this)) {
-                    Toast.makeText(
-                        this,
-                        "Without location, only Google's activity detection is used (less accurate on a motorbike).",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    toast("Without location, only Google's activity detection is used (less accurate on a motorbike).")
                 }
                 startTracking()
             } else {
-                Toast.makeText(
-                    this,
-                    "\"Physical activity\" permission is required to count steps.",
-                    Toast.LENGTH_LONG
-                ).show()
+                toast("\"Physical activity\" permission is required to count steps.")
             }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = false
         setContentView(R.layout.activity_main)
         db = StepDatabase.get(this)
 
-        todaySteps = findViewById(R.id.todaySteps)
-        todayRemoved = findViewById(R.id.todayRemoved)
+        // Keep content clear of the status bar / gesture bar (edge-to-edge on Android 15).
+        val content = findViewById<View>(R.id.content)
+        val basePadTop = content.paddingTop
+        val basePadBottom = content.paddingBottom
+        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.root)) { _, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            content.setPadding(content.paddingLeft, basePadTop + bars.top, content.paddingRight, basePadBottom + bars.bottom)
+            insets
+        }
+
+        dateText = findViewById(R.id.dateText)
+        statusDot = findViewById(R.id.statusDot)
+        statusPillText = findViewById(R.id.statusPillText)
+        ring = findViewById(R.id.ring)
+        goalText = findViewById(R.id.goalText)
         todayPending = findViewById(R.id.todayPending)
-        statusText = findViewById(R.id.statusText)
+        tileRemoved = findViewById(R.id.tileRemoved)
+        tileDistance = findViewById(R.id.tileDistance)
+        tileMinutes = findViewById(R.id.tileMinutes)
+        liveActivity = findViewById(R.id.liveActivity)
+        liveGps = findViewById(R.id.liveGps)
+        liveExtra = findViewById(R.id.liveExtra)
         toggleButton = findViewById(R.id.toggleButton)
-        historyList = findViewById(R.id.historyList)
+        weekChart = findViewById(R.id.weekChart)
+        weekTotal = findViewById(R.id.weekTotal)
         logList = findViewById(R.id.logList)
 
         toggleButton.setOnClickListener {
@@ -80,14 +114,16 @@ class MainActivity : AppCompatActivity() {
             handler.postDelayed({ refresh() }, 300)
         }
 
-        findViewById<MaterialButton>(R.id.batteryButton).setOnClickListener {
+        findViewById<View>(R.id.batteryButton).setOnClickListener {
             try {
                 startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
             } catch (e: Exception) {
                 startActivity(Intent(Settings.ACTION_SETTINGS))
             }
-            Toast.makeText(this, "Find TrueSteps and set it to \"Don't optimize\" / \"Unrestricted\"", Toast.LENGTH_LONG).show()
+            toast("Find TrueSteps and set it to \"Don't optimize\" / \"Unrestricted\"")
         }
+
+        goalText.setOnClickListener { showGoalDialog() }
 
         // Resume automatically if tracking was on (e.g. after the app was swiped away).
         if (Prefs.isTrackingEnabled(this) && !LiveState.serviceRunning && Permissions.hasActivityRecognition(this)) {
@@ -97,6 +133,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        lastLogSignature = ""
         handler.post(refresher)
     }
 
@@ -111,113 +148,154 @@ class MainActivity : AppCompatActivity() {
         handler.postDelayed({ refresh() }, 500)
     }
 
+    private fun showGoalDialog() {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(Prefs.goal(this@MainActivity).toString())
+            setSelection(text.length)
+        }
+        val box = FrameLayout(this).apply {
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(input)
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Daily step goal")
+            .setView(box)
+            .setPositiveButton("Save") { _, _ ->
+                val g = input.text.toString().toIntOrNull()
+                if (g != null && g in 500..100_000) {
+                    Prefs.setGoal(this, g)
+                    StepWidget.updateAll(this)
+                    refresh()
+                } else {
+                    toast("Enter a number between 500 and 100,000")
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     // ---------------------------------------------------------------- UI
 
     private fun refresh() {
         val now = System.currentTimeMillis()
-        val today = db.dayTotal(StepDatabase.dayKey(now))
-        todaySteps.text = "%,d".format(today.walkSteps)
-        todayRemoved.text = "%,d vehicle steps removed".format(today.vehicleSteps)
+        val dayKey = StepDatabase.dayKey(now)
+        val today = db.dayTotal(dayKey)
+        val goal = Prefs.goal(this)
+
+        dateText.text = SimpleDateFormat("EEE, d MMM", Locale.getDefault()).format(Date(now))
+
+        val pct = today.walkSteps * 100 / goal.coerceAtLeast(1)
+        ring.setProgress(today.walkSteps, goal, if (pct >= 100) "GOAL REACHED 🎉" else "$pct% OF GOAL")
+        goalText.text = "Goal %,d  ✎".format(goal)
 
         val waiting = LiveState.pendingSteps + LiveState.heldSteps
-        todayPending.text = if (waiting > 0) "$waiting steps being checked…" else ""
+        todayPending.visibility = if (waiting > 0) View.VISIBLE else View.GONE
+        todayPending.text = "+$waiting steps being checked…"
 
-        toggleButton.text = if (LiveState.serviceRunning) "Stop tracking" else "Start tracking"
-        statusText.text = statusLines(now)
+        tileRemoved.text = "%,d".format(today.vehicleSteps)
+        tileDistance.text = "%.1f km".format(today.walkSteps * 0.76f / 1000f)
+        val mins = db.walkMinutes(dayKey)
+        tileMinutes.text = if (mins >= 60) "${mins / 60}h ${mins % 60}m" else "${mins}m"
 
-        renderHistory(db.recentDays(7, now))
-        renderLog(db.recentLog(25))
+        renderStatus(now)
+        renderWeek(now, goal)
+        renderLog()
     }
 
-    private fun statusLines(now: Long): String {
-        if (!LiveState.serviceRunning) return "Tracking is off."
-        val lines = mutableListOf<String>()
+    private fun renderStatus(now: Long) {
+        val running = LiveState.serviceRunning
+        statusPillText.text = if (running) "Tracking" else "Off"
+        statusDot.imageTintList = ColorStateList.valueOf(color(if (running) R.color.lime else R.color.flame))
+
+        toggleButton.text = if (running) "Stop tracking" else "Start tracking"
+        toggleButton.backgroundTintList = ColorStateList.valueOf(color(if (running) R.color.surface_high else R.color.lime))
+        toggleButton.setTextColor(color(if (running) R.color.text_primary else R.color.on_lime))
+
+        if (!running) {
+            liveActivity.text = "🚶  Not tracking"
+            liveGps.text = "📍  GPS off"
+            liveExtra.visibility = View.GONE
+            return
+        }
 
         val m = LiveState.motion
-        lines += if (m == null || now - m.timeMs > 120_000) {
-            "Activity: waiting for Google activity detection…"
-        } else {
-            val label = when (m.motion) {
-                Motion.VEHICLE -> "In a vehicle"
-                Motion.BICYCLE -> "On a bike"
-                Motion.ON_FOOT -> "Walking"
-                Motion.STILL -> "Still"
-                Motion.UNKNOWN -> "Unknown"
-            }
-            "Activity: $label (${m.confidence}%)"
+        liveActivity.text = if (m == null || now - m.timeMs > 120_000) {
+            "⏳  Detecting…"
+        } else when (m.motion) {
+            Motion.VEHICLE -> "🏍  In vehicle ${m.confidence}%"
+            Motion.BICYCLE -> "🚲  On bike ${m.confidence}%"
+            Motion.ON_FOOT -> "🚶  Walking ${m.confidence}%"
+            Motion.STILL -> "🧍  Still ${m.confidence}%"
+            Motion.UNKNOWN -> "❔  Unknown"
         }
+        val isVehicle = m != null && (m.motion == Motion.VEHICLE || m.motion == Motion.BICYCLE) && now - m.timeMs <= 120_000
+        liveActivity.setTextColor(color(if (isVehicle) R.color.flame else R.color.text_primary))
 
         val speed = LiveState.lastSpeedKmh
-        lines += when {
-            !LiveState.gpsActive -> "GPS: off (turns on when you start moving)"
-            speed == null || now - LiveState.lastSpeedTimeMs > 30_000 -> "GPS: on, waiting for a fix…"
-            else -> "GPS: %.1f km/h".format(speed)
+        liveGps.text = when {
+            !LiveState.gpsActive -> "📍  GPS idle"
+            speed == null || now - LiveState.lastSpeedTimeMs > 30_000 -> "📍  Finding GPS…"
+            else -> "📍  %.0f km/h".format(speed)
         }
+        val fast = speed != null && LiveState.gpsActive && speed >= 15f && now - LiveState.lastSpeedTimeMs <= 30_000
+        liveGps.setTextColor(color(if (fast) R.color.flame else R.color.text_primary))
 
+        val extras = mutableListOf<String>()
         val sinceRide = now - LiveState.lastVehicleMs
         if (LiveState.lastVehicleMs > 0 && sinceRide < 3_600_000) {
-            lines += "Last ride detected: ${sinceRide / 60_000} min ago"
+            extras += "Last ride detected ${sinceRide / 60_000} min ago"
         }
-        if (!Permissions.hasLocation(this)) lines += "⚠ Location permission off: speed check disabled"
-        return lines.joinToString("\n")
+        if (!Permissions.hasLocation(this)) extras += "⚠ Location is off, so the speed check is disabled"
+        liveExtra.visibility = if (extras.isEmpty()) View.GONE else View.VISIBLE
+        liveExtra.text = extras.joinToString("\n")
     }
 
-    private fun renderHistory(days: List<DayTotal>) {
-        historyList.removeAllViews()
-        val maxSteps = days.maxOf { it.walkSteps }.coerceAtLeast(1)
+    private fun renderWeek(now: Long, goal: Int) {
+        val days = db.recentDays(7, now).reversed() // oldest first
         val inFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-        val outFmt = SimpleDateFormat("EEE d MMM", Locale.getDefault())
-
-        days.forEachIndexed { i, d ->
-            val label = if (i == 0) "Today" else inFmt.parse(d.day)?.let { outFmt.format(it) } ?: d.day
-
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(0, dp(6), 0, dp(6))
-            }
-            val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            header.addView(TextView(this).apply {
-                text = label
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            })
-            header.addView(TextView(this).apply {
-                text = buildString {
-                    append("%,d".format(d.walkSteps))
-                    if (d.vehicleSteps > 0) append("  (−%,d)".format(d.vehicleSteps))
-                }
-                gravity = Gravity.END
-            })
-            row.addView(header)
-            row.addView(LinearProgressIndicator(this).apply {
-                max = maxSteps
-                progress = d.walkSteps
-                setIndicatorColor(ContextCompat.getColor(this@MainActivity, R.color.brand))
-                trackCornerRadius = dp(3)
-                trackThickness = dp(6)
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = dp(4) }
-            })
-            historyList.addView(row)
+        val outFmt = SimpleDateFormat("EEE", Locale.getDefault())
+        val bars = days.mapIndexed { i, d ->
+            val label = inFmt.parse(d.day)?.let { outFmt.format(it) } ?: d.day
+            WeekChartView.Bar(label, d.walkSteps, d.vehicleSteps, isToday = i == days.lastIndex)
         }
+        weekChart.setData(bars, goal)
+        weekTotal.text = "%,d".format(days.sumOf { it.walkSteps })
     }
 
-    private fun renderLog(entries: List<LogEntry>) {
+    private fun renderLog() {
+        val entries = db.recentLog(25)
+        val signature = entries.firstOrNull()?.let { "${it.startMs}-${entries.size}" } ?: "empty"
+        if (signature == lastLogSignature) return
+        lastLogSignature = signature
+
         logList.removeAllViews()
         if (entries.isEmpty()) {
-            logList.addView(TextView(this).apply { text = "Nothing yet — go for a walk or a ride." })
+            logList.addView(TextView(this).apply {
+                text = "Nothing yet. Go for a walk or a ride."
+                setTextColor(color(R.color.text_secondary))
+                setPadding(0, dp(8), 0, dp(8))
+            })
             return
         }
         val timeFmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+        val inflater = LayoutInflater.from(this)
         for (e in entries) {
             val walk = e.kind == Kind.WALK
-            logList.addView(TextView(this).apply {
-                text = "${timeFmt.format(Date(e.startMs))}  ${if (walk) "✓ kept" else "✗ removed"} ${e.steps} — ${e.reason}"
-                setTextColor(ContextCompat.getColor(this@MainActivity, if (walk) R.color.brand else R.color.vehicle))
-                setPadding(0, dp(3), 0, dp(3))
-            })
+            val row = inflater.inflate(R.layout.item_log, logList, false)
+            row.findViewById<TextView>(R.id.badge).apply {
+                text = if (walk) "✓" else "✕"
+                setTextColor(color(if (walk) R.color.lime else R.color.flame))
+            }
+            row.findViewById<TextView>(R.id.title).text =
+                if (walk) "%,d steps kept".format(e.steps) else "%,d steps removed".format(e.steps)
+            row.findViewById<TextView>(R.id.reason).text = e.reason
+            row.findViewById<TextView>(R.id.time).text = timeFmt.format(Date(e.startMs))
+            logList.addView(row)
         }
     }
 
+    private fun color(res: Int) = ContextCompat.getColor(this, res)
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 }
