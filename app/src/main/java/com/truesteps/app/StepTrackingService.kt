@@ -56,10 +56,12 @@ class StepTrackingService : Service(), SensorEventListener {
         private const val IDLE_AFTER_MS = 120_000L
 
         // GPS bursts
-        private const val GPS_TRIGGER_STEPS = 20          // steps in the last 30 s before GPS is considered
+        private const val GPS_TRIGGER_STEPS = 3           // steps in the last 30 s before GPS is considered
         private const val GPS_BURST_FIXES = 3             // good fixes per burst
         private const val GPS_BURST_MAX_MS = 40_000L      // give up a burst after this long
         private const val GPS_COOLDOWN_MS = 60_000L       // pause between bursts
+        private const val GPS_NO_FIX_COOLDOWN_MS = 300_000L    // indoors (no fix): wait 5 min
+        private const val GPS_STATIONARY_COOLDOWN_MS = 120_000L // not travelling: wait 2 min
         private const val SPEED_MEMORY_MS = 75_000L       // how long a speed reading is used for decisions
 
         fun start(context: Context) {
@@ -343,7 +345,7 @@ class StepTrackingService : Service(), SensorEventListener {
     /**
      * GPS is the expensive part, so it only runs when:
      *  - not in quiet hours, and location permission is granted
-     *  - you're clearly moving (20+ steps in 30 s), or steps are waiting for a decision
+     *  - steps are coming in (3+ in 30 s), or steps are waiting for a decision
      *  - Google's activity detection isn't already sure on its own
      *  - the previous burst ended at least a minute ago
      */
@@ -389,8 +391,17 @@ class StepTrackingService : Service(), SensorEventListener {
 
     private fun endGpsBurst() {
         if (!gpsOn) return
+        val fixes = gpsBurstFixes
         stopGps()
-        gpsCooldownUntil = System.currentTimeMillis() + GPS_COOLDOWN_MS
+        val now = System.currentTimeMillis()
+        val lastSpeed = speeds.lastOrNull()?.second
+        // Save battery when GPS can't help: indoors (no fix) or clearly not travelling.
+        val cooldown = when {
+            fixes == 0 -> GPS_NO_FIX_COOLDOWN_MS
+            lastSpeed != null && lastSpeed < 2f -> GPS_STATIONARY_COOLDOWN_MS
+            else -> GPS_COOLDOWN_MS
+        }
+        gpsCooldownUntil = now + cooldown
     }
 
     private fun stopGps() {

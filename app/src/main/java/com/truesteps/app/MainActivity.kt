@@ -16,6 +16,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.truesteps.app.ui.StepRingView
 import com.truesteps.app.ui.WeekChartView
 import java.text.SimpleDateFormat
@@ -237,7 +238,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderLog() {
         val entries = db.recentLog(25)
-        val signature = entries.firstOrNull()?.let { "${it.startMs}-${entries.size}" } ?: "empty"
+        val signature = entries.joinToString(",") { "${it.id}${it.kind.name.first()}" }
         if (signature == lastLogSignature) return
         lastLogSignature = signature
 
@@ -263,8 +264,30 @@ class MainActivity : AppCompatActivity() {
                 if (walk) "%,d steps kept".format(e.steps) else "%,d steps removed".format(e.steps)
             row.findViewById<TextView>(R.id.reason).text = e.reason
             row.findViewById<TextView>(R.id.time).text = timeFmt.format(Date(e.startMs))
+            row.setOnClickListener { confirmCorrection(e) }
             logList.addView(row)
         }
+    }
+
+    /** Lets you fix a wrong decision: kept ↔ removed. */
+    private fun confirmCorrection(e: LogEntry) {
+        val toKind = if (e.kind == Kind.WALK) Kind.VEHICLE else Kind.WALK
+        val msg = if (toKind == Kind.VEHICLE) {
+            "Remove these %,d steps? Use this if you were in a car or on a bike at that time."
+        } else {
+            "Keep these %,d steps? Use this if you were really walking at that time."
+        }.format(e.steps)
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Fix this entry")
+            .setMessage(msg)
+            .setPositiveButton(if (toKind == Kind.VEHICLE) "Remove steps" else "Keep steps") { _, _ ->
+                db.setKind(e.id, toKind)
+                StepWidget.updateAll(this)
+                lastLogSignature = ""
+                refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun color(res: Int) = ContextCompat.getColor(this, res)

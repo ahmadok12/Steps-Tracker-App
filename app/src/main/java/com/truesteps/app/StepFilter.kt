@@ -42,15 +42,21 @@ class StepFilter(
     private val walkingMaxSpeedKmh: Float = 8f,
     private val minConfidence: Int = 60,
     private val maxCadencePerSec: Float = 4.0f,
-    private val motionMaxAgeMs: Long = 90_000,
+    private val motionMaxAgeMs: Long = 200_000,
     private val hangoverMs: Long = 180_000,
     private val maxHoldMs: Long = 300_000,
 ) {
     private enum class Verdict { WALK, VEHICLE, UNSURE }
 
-    private data class Decision(val verdict: Verdict, val reason: String, val strong: Boolean)
+    private data class Decision(
+        val verdict: Verdict,
+        val reason: String,
+        val strong: Boolean,
+        /** For UNSURE: if nothing settles it, treat as vehicle rather than walking. */
+        val leanVehicle: Boolean = false,
+    )
 
-    private val held = ArrayDeque<WindowInput>()
+    private val held = ArrayDeque<Pair<WindowInput, Boolean>>() // (window, leans vehicle)
 
     /** Last time we had clear evidence of being in a vehicle. */
     var lastVehicleMs: Long = 0L
@@ -59,7 +65,7 @@ class StepFilter(
     /** Last time walking was confirmed by activity recognition. */
     private var lastFootConfirmedMs: Long = 0L
 
-    val heldSteps: Int get() = held.sumOf { it.steps }
+    val heldSteps: Int get() = held.sumOf { it.first.steps }
 
     fun process(w: WindowInput): List<CommittedWindow> {
         val d = decide(w)
@@ -76,7 +82,7 @@ class StepFilter(
                 if (w.steps > 0 || d.strong) out += resolveHeld(Kind.WALK, "Confirmed walking afterwards")
                 if (w.steps > 0) out += w.commit(Kind.WALK, d.reason)
             }
-            Verdict.UNSURE -> if (w.steps > 0) held.addLast(w)
+            Verdict.UNSURE -> if (w.steps > 0) held.addLast(w to d.leanVehicle)
         }
         out += expireHeld(w.endMs)
         return out
@@ -125,32 +131,44 @@ class StepFilter(
         if (inHangover) {
             return Decision(Verdict.UNSURE, "Just after a ride", false)
         }
+        if (w.steps == 0) {
+            // Nothing to save; a clear walking speed can still settle earlier held steps.
+            return Decision(Verdict.WALK, "No steps", speed != null && speed in 2f..walkingMaxSpeedKmh)
+        }
         // 6. GPS shows walking pace or standing.
         if (speed != null && speed < walkingMaxSpeedKmh) {
-            return Decision(Verdict.WALK, "Walking pace (${"%.1f".format(speed)} km/h)", speed >= 2f)
+            // Moving at walking speed but hardly any steps = a vehicle crawling in traffic, not walking.
+            if (speed >= 2f && cadence < 0.7f) {
+                return Decision(Verdict.UNSURE, "Moving, but too few steps for walking", false, leanVehicle = true)
+            }
+            return if (speed >= 2f) {
+                Decision(Verdict.WALK, "Walking pace (${"%.1f".format(speed)} km/h)", true)
+            } else {
+                Decision(Verdict.WALK, "Small movement, not travelling", false)
+            }
         }
-        // 7. A few steps around the house/office.
-        if (w.steps in 1 until 15) {
-            return Decision(Verdict.WALK, "Small movement", false)
-        }
-        if (w.steps == 0) return Decision(Verdict.WALK, "No steps", false)
-        // 8. Many steps, but no GPS or activity info yet: wait for more evidence.
+        // 7. Steps with no GPS and no "walking" from Google: never keep blindly.
+        //    (In a smooth car Google often says "still" while vibration adds a few steps.)
+        //    Held until GPS or Google decides; kept after 5 min if no vehicle shows up.
         return Decision(Verdict.UNSURE, "Waiting for GPS/activity", false)
     }
 
     private fun resolveHeld(kind: Kind, reason: String): List<CommittedWindow> {
-        val out = held.map { it.commit(kind, reason) }
+        val out = held.map { it.first.commit(kind, reason) }
         held.clear()
         return out
     }
 
     private fun expireHeld(nowMs: Long, force: Boolean = false): List<CommittedWindow> {
         val out = mutableListOf<CommittedWindow>()
-        while (held.isNotEmpty() && (force || nowMs - held.first().endMs >= maxHoldMs)) {
-            val w = held.removeFirst()
+        while (held.isNotEmpty() && (force || nowMs - held.first().first.endMs >= maxHoldMs)) {
+            val (w, leanVehicle) = held.removeFirst()
             val nearRide = w.endMs - lastVehicleMs < hangoverMs && lastFootConfirmedMs < lastVehicleMs
-            out += if (nearRide) w.commit(Kind.VEHICLE, "Close to a ride, never confirmed walking")
-            else w.commit(Kind.WALK, "No vehicle signs")
+            out += when {
+                nearRide -> w.commit(Kind.VEHICLE, "Close to a ride, never confirmed walking")
+                leanVehicle -> w.commit(Kind.VEHICLE, "Slow travel with too few steps (traffic)")
+                else -> w.commit(Kind.WALK, "No vehicle signs")
+            }
         }
         return out
     }

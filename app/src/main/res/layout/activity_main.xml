@@ -352,7 +352,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="2dp"
-                android:text="Every 30-second block, and why it was kept or removed"
+                android:text="Every 30-second block and why it was kept or removed. Tap one to fix it."
                 android:textColor="@color/text_secondary"
                 android:textSize="12sp" />
 

@@ -11,11 +11,14 @@ Steps are collected in 30-second blocks. Each block is checked against:
 3. **Step rate**: more than 4 steps per second is vibration, not feet, so the block is removed.
 4. **Walking confirmed**: Google says "Walking" or GPS shows walking pace, so the block is kept.
 5. **Right after a ride** (3 minutes): slow movement is held until walking is confirmed. This handles traffic jams and signals.
-6. **Not sure yet** (for example, GPS hasn't locked on at the start of a ride): the block is held. The next clear block decides it.
+6. **Moving at walking speed with too few steps** (a car crawling in traffic): the block is held, and it's removed if nothing shows real walking.
+7. **No evidence either way** (no GPS reading, and Google isn't saying "walking"): the block is held, never kept blindly. The next clear block decides it. If nothing points to a vehicle within 5 minutes, it's kept.
+
+Tap any entry in "Recent decisions" to switch it between kept and removed.
 
 ## Battery
 
-- GPS runs only in short bursts (3 readings, then off for at least a minute). A burst starts only when there are 20+ steps in 30 seconds and Google's activity detection isn't already confident.
+- GPS runs only in short bursts (3 readings, then off for at least a minute). A burst starts when steps come in (3+ in 30 seconds) and Google's activity detection isn't already confident. It waits 5 minutes after a burst with no GPS fix (indoors), and 2 minutes after one that shows you're not travelling.
 - Activity detection checks every 30 seconds while you're moving, and every 3 minutes while you're idle.
 - Step updates are grouped about every 10 seconds, so the processor can sleep in between.
 - **Quiet hours** (Settings ⚙): only the step counter runs. GPS and activity detection are off.
